@@ -2,15 +2,14 @@ const express = require("express");
 const cors = require("cors");
 
 const app = express();
-
 const PORT = process.env.PORT || 3000;
-
-// -----------------------------------------------------------------------------
-// ENVIRONMENT VARIABLES
-// -----------------------------------------------------------------------------
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+
+const OSRM_BASE_URL =
+  process.env.OSRM_BASE_URL ||
+  "https://router.project-osrm.org";
 
 if (!GROQ_API_KEY) {
   console.error("ERROR: GROQ_API_KEY is not set.");
@@ -20,20 +19,14 @@ if (!GROQ_API_KEY) {
   process.exit(1);
 }
 
-// Google Maps is optional for local startup.
-// The /api/place endpoint will return a useful error if it is missing.
 if (!GOOGLE_MAPS_API_KEY) {
   console.warn(
     "WARNING: GOOGLE_MAPS_API_KEY is not set. Google Places features will be unavailable."
   );
 }
 
-// -----------------------------------------------------------------------------
-// MIDDLEWARE
-// -----------------------------------------------------------------------------
-
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 // -----------------------------------------------------------------------------
 // HEALTH CHECK
@@ -45,23 +38,15 @@ app.get("/", (req, res) => {
     status: "online",
     ai: "Groq",
     model: "openai/gpt-oss-20b",
-    places: GOOGLE_MAPS_API_KEY ? "enabled" : "disabled",
+    places: GOOGLE_MAPS_API_KEY
+      ? "enabled"
+      : "disabled",
+    routes: "OSRM",
   });
 });
 
 // -----------------------------------------------------------------------------
 // GOOGLE PLACES SEARCH + PHOTO
-// -----------------------------------------------------------------------------
-//
-// GET /api/place?query=India%20Gate
-//
-// This endpoint:
-// 1. Searches Google Places (New)
-// 2. Gets the best matching place
-// 3. Gets its first available photo
-// 4. Returns the photo URL and attribution
-//
-// The Google server key stays on the backend.
 // -----------------------------------------------------------------------------
 
 app.get("/api/place", async (req, res) => {
@@ -74,7 +59,9 @@ app.get("/api/place", async (req, res) => {
       });
     }
 
-    const query = String(req.query.query || "").trim();
+    const query = String(
+      req.query.query || ""
+    ).trim();
 
     if (!query) {
       return res.status(400).json({
@@ -83,20 +70,19 @@ app.get("/api/place", async (req, res) => {
       });
     }
 
-    // -------------------------------------------------------------------------
-    // SEARCH PLACE
-    // -------------------------------------------------------------------------
-
     const placesResponse = await fetch(
       "https://places.googleapis.com/v1/places:searchText",
       {
         method: "POST",
+
         headers: {
           "Content-Type": "application/json",
-          "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+          "X-Goog-Api-Key":
+            GOOGLE_MAPS_API_KEY,
           "X-Goog-FieldMask":
             "places.id,places.displayName,places.formattedAddress,places.location,places.photos",
         },
+
         body: JSON.stringify({
           textQuery: query,
           languageCode: "en",
@@ -105,7 +91,8 @@ app.get("/api/place", async (req, res) => {
       }
     );
 
-    const placesData = await placesResponse.json();
+    const placesData =
+      await placesResponse.json();
 
     if (!placesResponse.ok) {
       console.error(
@@ -113,24 +100,25 @@ app.get("/api/place", async (req, res) => {
         placesData
       );
 
-      return res.status(placesResponse.status).json({
-        success: false,
-        error: "Unable to search Google Places.",
-      });
+      return res
+        .status(placesResponse.status)
+        .json({
+          success: false,
+          error:
+            "Unable to search Google Places.",
+        });
     }
 
-    const place = placesData.places?.[0];
+    const place =
+      placesData.places?.[0];
 
     if (!place) {
       return res.status(404).json({
         success: false,
-        error: "No matching place was found.",
+        error:
+          "No matching place was found.",
       });
     }
-
-    // -------------------------------------------------------------------------
-    // GET PHOTO
-    // -------------------------------------------------------------------------
 
     let photoUrl = null;
     let photoAttributions = [];
@@ -139,23 +127,27 @@ app.get("/api/place", async (req, res) => {
       Array.isArray(place.photos) &&
       place.photos.length > 0
     ) {
-      const photoName = place.photos[0].name;
+      const photoName =
+        place.photos[0].name;
 
-      const photoResponse = await fetch(
-        `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=900&maxHeightPx=600&skipHttpRedirect=true`,
-        {
-          headers: {
-            "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
-          },
-        }
-      );
+      const photoResponse =
+        await fetch(
+          `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=1200&maxHeightPx=800&skipHttpRedirect=true`,
+          {
+            headers: {
+              "X-Goog-Api-Key":
+                GOOGLE_MAPS_API_KEY,
+            },
+          }
+        );
 
       if (photoResponse.ok) {
         const photoData =
           await photoResponse.json();
 
         photoUrl =
-          photoData.photoUri || null;
+          photoData.photoUri ||
+          null;
       } else {
         console.warn(
           "PLACE PHOTO ERROR:",
@@ -169,12 +161,9 @@ app.get("/api/place", async (req, res) => {
           .authorAttributions || [];
     }
 
-    // -------------------------------------------------------------------------
-    // RETURN PLACE DATA
-    // -------------------------------------------------------------------------
-
     return res.json({
       success: true,
+
       place: {
         id: place.id || null,
 
@@ -214,6 +203,178 @@ app.get("/api/place", async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
+// OSRM ROAD ROUTING
+// -----------------------------------------------------------------------------
+//
+// This endpoint intentionally uses OSRM instead of Google Routes so that
+// EasyTrip can draw real road geometry without depending on Google Routes
+// billing/permissions.
+//
+// Response format remains compatible with the Flutter app:
+//
+// {
+//   success: true,
+//   distanceMeters: 123,
+//   duration: "123s",
+//   polyline: "encoded polyline"
+// }
+//
+// OSRM's public router is primarily used here for driving routes.
+// Walking/transit can fall back to Google Maps from the Flutter UI.
+// -----------------------------------------------------------------------------
+
+app.post("/api/route", async (req, res) => {
+  try {
+    const {
+      origin,
+      destination,
+      mode,
+    } = req.body || {};
+
+    const originLat =
+      Number(origin?.latitude);
+
+    const originLng =
+      Number(origin?.longitude);
+
+    const destinationLat =
+      Number(destination?.latitude);
+
+    const destinationLng =
+      Number(destination?.longitude);
+
+    if (
+      !Number.isFinite(originLat) ||
+      !Number.isFinite(originLng) ||
+      !Number.isFinite(destinationLat) ||
+      !Number.isFinite(destinationLng)
+    ) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "Valid origin and destination coordinates are required.",
+      });
+    }
+
+    const selectedMode =
+      String(mode || "driving")
+        .trim()
+        .toLowerCase();
+
+    if (selectedMode !== "driving") {
+      return res.status(400).json({
+        success: false,
+        error:
+          "Live in-app road routing currently supports driving. Use Google Maps for walking or transit navigation.",
+      });
+    }
+
+    const coordinates =
+      `${originLng},${originLat};${destinationLng},${destinationLat}`;
+
+    const url =
+      `${OSRM_BASE_URL}/route/v1/driving/${coordinates}` +
+      "?overview=full" +
+      "&geometries=polyline" +
+      "&steps=false" +
+      "&alternatives=false";
+
+    console.log(
+      "OSRM ROUTE REQUEST:",
+      url
+    );
+
+    const routeResponse =
+      await fetch(url);
+
+    const routeData =
+      await routeResponse.json();
+
+    if (
+      !routeResponse.ok ||
+      routeData.code !== "Ok"
+    ) {
+      console.error(
+        "OSRM ROUTE ERROR:",
+        routeData
+      );
+
+      return res.status(502).json({
+        success: false,
+        error:
+          routeData?.message ||
+          "Unable to calculate the road route.",
+      });
+    }
+
+    const route =
+      routeData.routes?.[0];
+
+    if (!route) {
+      return res.status(404).json({
+        success: false,
+        error:
+          "No road route was returned.",
+      });
+    }
+
+    const encodedPolyline =
+      route.geometry;
+
+    if (
+      !encodedPolyline ||
+      String(encodedPolyline).trim() === ""
+    ) {
+      return res.status(404).json({
+        success: false,
+        error:
+          "The routing service returned no route geometry.",
+      });
+    }
+
+    const distanceMeters =
+      Number(route.distance);
+
+    const durationSeconds =
+      Number(route.duration);
+
+    return res.status(200).json({
+      success: true,
+
+      distanceMeters:
+        Number.isFinite(distanceMeters)
+          ? distanceMeters
+          : null,
+
+      duration:
+        Number.isFinite(durationSeconds)
+          ? `${Math.round(
+              durationSeconds
+            )}s`
+          : null,
+
+      polyline:
+        encodedPolyline,
+
+      mode: "driving",
+
+      provider: "OSRM",
+    });
+  } catch (error) {
+    console.error(
+      "ROUTE ERROR:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      error:
+        "Unable to calculate the road route right now.",
+    });
+  }
+});
+
+// -----------------------------------------------------------------------------
 // GROQ AI TRIP PLANNER
 // -----------------------------------------------------------------------------
 
@@ -230,17 +391,14 @@ app.post("/api/plan-trip", async (req, res) => {
       transport,
     } = req.body;
 
-    // -------------------------------------------------------------------------
-    // VALIDATION
-    // -------------------------------------------------------------------------
-
     if (
       !destination ||
-      !destination.trim()
+      !String(destination).trim()
     ) {
       return res.status(400).json({
         success: false,
-        error: "Destination is required.",
+        error:
+          "Destination is required.",
       });
     }
 
@@ -253,13 +411,14 @@ app.post("/api/plan-trip", async (req, res) => {
     }
 
     const origin =
-      from && from.trim()
-        ? from.trim()
+      from &&
+      String(from).trim()
+        ? String(from).trim()
         : "Current Location";
 
-    // -------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
     // CALCULATE DURATION
-    // -------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
 
     let tripDuration =
       days || "Not specified";
@@ -272,8 +431,12 @@ app.post("/api/plan-trip", async (req, res) => {
         new Date(endDate);
 
       if (
-        !isNaN(start.getTime()) &&
-        !isNaN(end.getTime())
+        !Number.isNaN(
+          start.getTime()
+        ) &&
+        !Number.isNaN(
+          end.getTime()
+        )
       ) {
         const difference =
           Math.round(
@@ -294,12 +457,12 @@ app.post("/api/plan-trip", async (req, res) => {
       // Keep fallback duration.
     }
 
-    // -------------------------------------------------------------------------
-    // PROMPT
-    // -------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
+    // GROQ PROMPT
+    // ---------------------------------------------------------------------------
 
     const prompt = `
-You are EasyTrip, a fast AI travel planning assistant.
+You are EasyTrip, a fast premium AI travel planning assistant.
 
 Create a practical, realistic and budget-conscious travel itinerary.
 
@@ -348,7 +511,7 @@ GOOD:
 BAD:
 "India Gate and Red Fort"
 
-The application will use each place name with Google Places to retrieve
+The application uses each place name with Google Places to retrieve
 location and photo information.
 
 IMPORTANT SPEED RULE
@@ -356,6 +519,12 @@ IMPORTANT SPEED RULE
 Keep descriptions SHORT.
 Do not write long paragraphs.
 Use concise useful descriptions.
+
+IMPORTANT QUALITY RULE
+----------------------
+Make the itinerary feel premium and personalized.
+Avoid generic filler.
+Choose attractions that make geographic sense together.
 
 RETURN ONLY VALID JSON.
 NO MARKDOWN.
@@ -393,60 +562,62 @@ RETURN EXACTLY THIS STRUCTURE:
 }
 `;
 
-    // -------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
     // GROQ REQUEST
-    // -----------------------------------------------------------------------------
-    //
-    // Groq's API is OpenAI-compatible.
-    // We use JSON object mode so the Flutter app receives predictable JSON.
-    // We also use low reasoning effort to reduce latency.
-    // -----------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
 
-    const groqResponse = await fetch(
-      "https://api.groq.com/openai/v1/chat/completions",
-      {
-        method: "POST",
+    const groqResponse =
+      await fetch(
+        "https://api.groq.com/openai/v1/chat/completions",
+        {
+          method: "POST",
 
-        headers: {
-          "Content-Type": "application/json",
-          Authorization:
-            `Bearer ${GROQ_API_KEY}`,
-        },
+          headers: {
+            "Content-Type":
+              "application/json",
 
-        body: JSON.stringify({
-          model: "openai/gpt-oss-20b",
-
-          messages: [
-            {
-              role: "system",
-              content:
-                "You are EasyTrip. Return only valid JSON. Keep responses concise and practical.",
-            },
-            {
-              role: "user",
-              content: prompt,
-            },
-          ],
-
-          temperature: 0.3,
-
-          reasoning_effort: "low",
-
-          max_completion_tokens: 5000,
-
-          response_format: {
-            type: "json_object",
+            Authorization:
+              `Bearer ${GROQ_API_KEY}`,
           },
-        }),
-      }
-    );
+
+          body: JSON.stringify({
+            model:
+              "openai/gpt-oss-20b",
+
+            messages: [
+              {
+                role: "system",
+
+                content:
+                  "You are EasyTrip. Return only valid JSON. Keep responses concise, realistic and practical.",
+              },
+
+              {
+                role: "user",
+
+                content: prompt,
+              },
+            ],
+
+            temperature: 0.3,
+
+            reasoning_effort: "low",
+
+            max_completion_tokens: 5000,
+
+            response_format: {
+              type: "json_object",
+            },
+          }),
+        }
+      );
 
     const groqData =
       await groqResponse.json();
 
-    // -------------------------------------------------------------------------
-    // HANDLE GROQ ERROR
-    // -------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
+    // GROQ ERROR
+    // ---------------------------------------------------------------------------
 
     if (!groqResponse.ok) {
       console.error(
@@ -454,24 +625,25 @@ RETURN EXACTLY THIS STRUCTURE:
         groqData
       );
 
-      const groqMessage =
-        groqData?.error?.message ||
-        "Groq API request failed.";
-
-      return res.status(
-        groqResponse.status
-      ).json({
-        success: false,
-        error: groqMessage,
-      });
+      return res
+        .status(
+          groqResponse.status
+        )
+        .json({
+          success: false,
+          error:
+            groqData?.error?.message ||
+            "Groq API request failed.",
+        });
     }
 
-    // -------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
     // GET MODEL TEXT
-    // -------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
 
     const text =
-      groqData?.choices?.[0]?.message?.content;
+      groqData?.choices?.[0]
+        ?.message?.content;
 
     if (
       !text ||
@@ -482,9 +654,9 @@ RETURN EXACTLY THIS STRUCTURE:
       );
     }
 
-    // -------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
     // PARSE JSON
-    // -------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
 
     let itinerary;
 
@@ -495,7 +667,8 @@ RETURN EXACTLY THIS STRUCTURE:
         );
     } catch (parseError) {
       console.error(
-        "GROQ RETURNED INVALID JSON:"
+        "GROQ RETURNED INVALID JSON:",
+        parseError
       );
 
       console.error(text);
@@ -507,9 +680,9 @@ RETURN EXACTLY THIS STRUCTURE:
       });
     }
 
-    // -------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
     // RETURN RESULT
-    // -------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
 
     return res.status(200).json({
       success: true,
@@ -549,14 +722,20 @@ app.listen(
       "AI model: openai/gpt-oss-20b"
     );
 
-    if (GOOGLE_MAPS_API_KEY) {
-      console.log(
-        "Google Places integration is enabled."
-      );
-    } else {
-      console.log(
-        "Google Places integration is disabled."
-      );
-    }
+    console.log(
+      `Google Places integration is ${
+        GOOGLE_MAPS_API_KEY
+          ? "enabled"
+          : "disabled"
+      }.`
+    );
+
+    console.log(
+      `Route provider: OSRM`
+    );
+
+    console.log(
+      `OSRM server: ${OSRM_BASE_URL}`
+    );
   }
 );
