@@ -5,11 +5,23 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
 const OSRM_BASE_URL =
   process.env.OSRM_BASE_URL ||
   "https://router.project-osrm.org";
+
+const NOMINATIM_URL =
+  "https://nominatim.openstreetmap.org";
+
+const WIKIMEDIA_API_URL =
+  "https://commons.wikimedia.org/w/api.php";
+
+const APP_USER_AGENT =
+  "EasyTrip/1.0 (travel planning app)";
+
+// -----------------------------------------------------------------------------
+// ENVIRONMENT CHECKS
+// -----------------------------------------------------------------------------
 
 if (!GROQ_API_KEY) {
   console.error("ERROR: GROQ_API_KEY is not set.");
@@ -19,14 +31,52 @@ if (!GROQ_API_KEY) {
   process.exit(1);
 }
 
-if (!GOOGLE_MAPS_API_KEY) {
-  console.warn(
-    "WARNING: GOOGLE_MAPS_API_KEY is not set. Google Places features will be unavailable."
-  );
-}
+// -----------------------------------------------------------------------------
+// MIDDLEWARE
+// -----------------------------------------------------------------------------
 
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+
+app.use(
+  express.json({
+    limit: "1mb",
+  })
+);
+
+// -----------------------------------------------------------------------------
+// SIMPLE IN-MEMORY CACHE
+// -----------------------------------------------------------------------------
+
+const placeCache = new Map();
+const photoCache = new Map();
+
+const PLACE_CACHE_TIME = 10 * 60 * 1000;
+const PHOTO_CACHE_TIME = 60 * 60 * 1000;
+
+function getCached(cache, key, maxAge) {
+  const item = cache.get(key);
+
+  if (!item) {
+    return null;
+  }
+
+  if (
+    Date.now() - item.timestamp >
+    maxAge
+  ) {
+    cache.delete(key);
+    return null;
+  }
+
+  return item.value;
+}
+
+function setCached(cache, key, value) {
+  cache.set(key, {
+    timestamp: Date.now(),
+    value,
+  });
+}
 
 // -----------------------------------------------------------------------------
 // HEALTH CHECK
@@ -36,29 +86,25 @@ app.get("/", (req, res) => {
   res.json({
     message: "EasyTrip backend is running 🚀",
     status: "online",
+
     ai: "Groq",
     model: "openai/gpt-oss-20b",
-    places: GOOGLE_MAPS_API_KEY
-      ? "enabled"
-      : "disabled",
+
+    places: "OpenStreetMap Nominatim",
+
+    photos: "Wikimedia Commons",
+
     routes: "OSRM",
   });
 });
 
 // -----------------------------------------------------------------------------
-// GOOGLE PLACES SEARCH + PHOTO
+// PLACE SEARCH
+// OpenStreetMap Nominatim
 // -----------------------------------------------------------------------------
 
 app.get("/api/place", async (req, res) => {
   try {
-    if (!GOOGLE_MAPS_API_KEY) {
-      return res.status(503).json({
-        success: false,
-        error:
-          "Google Places is not configured on the EasyTrip server.",
-      });
-    }
-
     const query = String(
       req.query.query || ""
     ).trim();
@@ -70,47 +116,78 @@ app.get("/api/place", async (req, res) => {
       });
     }
 
-    const placesResponse = await fetch(
-      "https://places.googleapis.com/v1/places:searchText",
-      {
-        method: "POST",
-
-        headers: {
-          "Content-Type": "application/json",
-          "X-Goog-Api-Key":
-            GOOGLE_MAPS_API_KEY,
-          "X-Goog-FieldMask":
-            "places.id,places.displayName,places.formattedAddress,places.location,places.photos",
-        },
-
-        body: JSON.stringify({
-          textQuery: query,
-          languageCode: "en",
-          pageSize: 1,
-        }),
-      }
+    console.log(
+      "PLACE SEARCH:",
+      query
     );
 
-    const placesData =
-      await placesResponse.json();
+    const normalizedQuery =
+      query.toLowerCase();
 
-    if (!placesResponse.ok) {
-      console.error(
-        "PLACES SEARCH ERROR:",
-        placesData
+    // -------------------------------------------------------------------------
+    // CACHE
+    // -------------------------------------------------------------------------
+
+    const cachedPlace = getCached(
+      placeCache,
+      normalizedQuery,
+      PLACE_CACHE_TIME
+    );
+
+    if (cachedPlace) {
+      console.log(
+        "PLACE CACHE HIT:",
+        query
       );
 
-      return res
-        .status(placesResponse.status)
-        .json({
-          success: false,
-          error:
-            "Unable to search Google Places.",
-        });
+      return res.json(cachedPlace);
+    }
+
+    // -------------------------------------------------------------------------
+    // NOMINATIM REQUEST
+    // -------------------------------------------------------------------------
+
+    const url =
+      `${NOMINATIM_URL}/search` +
+      `?format=jsonv2` +
+      `&q=${encodeURIComponent(query)}` +
+      `&limit=1` +
+      `&addressdetails=1` +
+      `&accept-language=en`;
+
+    const response =
+      await fetch(url, {
+        headers: {
+          "User-Agent":
+            APP_USER_AGENT,
+          Accept:
+            "application/json",
+        },
+      });
+
+    const data =
+      await response.json();
+
+    if (!response.ok) {
+      console.error(
+        "NOMINATIM ERROR:",
+        response.status,
+        data
+      );
+
+      return res.status(
+        response.status
+      ).json({
+        success: false,
+        error:
+          "Unable to search the place right now.",
+      });
     }
 
     const place =
-      placesData.places?.[0];
+      Array.isArray(data)
+        ? data[0]
+        : null;
 
     if (!place) {
       return res.status(404).json({
@@ -120,74 +197,96 @@ app.get("/api/place", async (req, res) => {
       });
     }
 
-    let photoUrl = null;
-    let photoAttributions = [];
+    const latitude =
+      Number(place.lat);
 
-    if (
-      Array.isArray(place.photos) &&
-      place.photos.length > 0
-    ) {
-      const photoName =
-        place.photos[0].name;
+    const longitude =
+      Number(place.lon);
 
-      const photoResponse =
-        await fetch(
-          `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=1200&maxHeightPx=800&skipHttpRedirect=true`,
-          {
-            headers: {
-              "X-Goog-Api-Key":
-                GOOGLE_MAPS_API_KEY,
-            },
-          }
+    const name =
+      place.name ||
+      place.display_name ||
+      query;
+
+    const address =
+      place.display_name ||
+      "";
+
+    // -------------------------------------------------------------------------
+    // FIND WIKIMEDIA PHOTO
+    // -------------------------------------------------------------------------
+
+    let photoInfo = null;
+
+    try {
+      photoInfo =
+        await findWikimediaPhoto(
+          name,
+          address,
+          latitude,
+          longitude
         );
-
-      if (photoResponse.ok) {
-        const photoData =
-          await photoResponse.json();
-
-        photoUrl =
-          photoData.photoUri ||
-          null;
-      } else {
-        console.warn(
-          "PLACE PHOTO ERROR:",
-          photoResponse.status,
-          await photoResponse.text()
-        );
-      }
-
-      photoAttributions =
-        place.photos[0]
-          .authorAttributions || [];
+    } catch (photoError) {
+      console.warn(
+        "WIKIMEDIA PHOTO SEARCH FAILED:",
+        photoError.message
+      );
     }
 
-    return res.json({
+    const result = {
       success: true,
 
       place: {
-        id: place.id || null,
+        id:
+          place.osm_id
+            ? `${place.osm_type || "osm"}-${place.osm_id}`
+            : null,
 
-        name:
-          place.displayName?.text ||
-          query,
+        name,
 
-        address:
-          place.formattedAddress ||
-          "",
+        address,
 
         latitude:
-          place.location?.latitude ??
-          null,
+          Number.isFinite(latitude)
+            ? latitude
+            : null,
 
         longitude:
-          place.location?.longitude ??
+          Number.isFinite(longitude)
+            ? longitude
+            : null,
+
+        photoUrl:
+          photoInfo?.photoUrl ||
           null,
 
-        photoUrl,
+        photoAttributions:
+          photoInfo?.photoAttributions ||
+          [],
 
-        photoAttributions,
+        photoProxyUrl:
+          photoInfo
+            ? `/api/place-photo?query=${encodeURIComponent(
+                name
+              )}`
+            : null,
+
+        provider:
+          "OpenStreetMap Nominatim",
       },
-    });
+    };
+
+    // -------------------------------------------------------------------------
+    // CACHE
+    // -------------------------------------------------------------------------
+
+    setCached(
+      placeCache,
+      normalizedQuery,
+      result
+    );
+
+    return res.json(result);
   } catch (error) {
     console.error(
       "PLACE ERROR:",
@@ -197,271 +296,664 @@ app.get("/api/place", async (req, res) => {
     return res.status(500).json({
       success: false,
       error:
+        error?.message ||
         "Unable to load place information right now.",
     });
   }
 });
 
 // -----------------------------------------------------------------------------
-// OSRM ROAD ROUTING
-// -----------------------------------------------------------------------------
-//
-// This endpoint intentionally uses OSRM instead of Google Routes so that
-// EasyTrip can draw real road geometry without depending on Google Routes
-// billing/permissions.
-//
-// Response format remains compatible with the Flutter app:
-//
-// {
-//   success: true,
-//   distanceMeters: 123,
-//   duration: "123s",
-//   polyline: "encoded polyline"
-// }
-//
-// OSRM's public router is primarily used here for driving routes.
-// Walking/transit can fall back to Google Maps from the Flutter UI.
+// WIKIMEDIA COMMONS PHOTO SEARCH
 // -----------------------------------------------------------------------------
 
-app.post("/api/route", async (req, res) => {
-  try {
-    const {
-      origin,
-      destination,
-      mode,
-    } = req.body || {};
+async function findWikimediaPhoto(
+  placeName,
+  address,
+  latitude,
+  longitude
+) {
+  const cacheKey =
+    `${placeName}|${latitude}|${longitude}`.toLowerCase();
 
-    const originLat =
-      Number(origin?.latitude);
+  const cachedPhoto = getCached(
+    photoCache,
+    cacheKey,
+    PHOTO_CACHE_TIME
+  );
 
-    const originLng =
-      Number(origin?.longitude);
+  if (cachedPhoto) {
+    return cachedPhoto;
+  }
 
-    const destinationLat =
-      Number(destination?.latitude);
+  const searches = [
+    `${placeName}`,
+    `${placeName} ${address}`,
+  ];
 
-    const destinationLng =
-      Number(destination?.longitude);
+  for (const searchText of searches) {
+    try {
+      const params =
+        new URLSearchParams({
+          action: "query",
+          generator: "search",
 
-    if (
-      !Number.isFinite(originLat) ||
-      !Number.isFinite(originLng) ||
-      !Number.isFinite(destinationLat) ||
-      !Number.isFinite(destinationLng)
-    ) {
-      return res.status(400).json({
-        success: false,
-        error:
-          "Valid origin and destination coordinates are required.",
-      });
+          gsrsearch:
+            searchText,
+
+          gsrnamespace: "6",
+
+          gsrlimit: "5",
+
+          prop:
+            "imageinfo",
+
+          iiprop:
+            "url|extmetadata",
+
+          iiurlwidth:
+            "1600",
+
+          format:
+            "json",
+
+          origin:
+            "*",
+        });
+
+      const url =
+        `${WIKIMEDIA_API_URL}?${params.toString()}`;
+
+      const response =
+        await fetch(url, {
+          headers: {
+            "User-Agent":
+              APP_USER_AGENT,
+
+            Accept:
+              "application/json",
+          },
+        });
+
+      if (!response.ok) {
+        continue;
+      }
+
+      const data =
+        await response.json();
+
+      const pages =
+        data?.query?.pages
+          ? Object.values(
+              data.query.pages
+            )
+          : [];
+
+      for (const page of pages) {
+        const imageInfo =
+          page?.imageinfo?.[0];
+
+        if (!imageInfo) {
+          continue;
+        }
+
+        const photoUrl =
+          imageInfo.thumburl ||
+          imageInfo.url ||
+          null;
+
+        if (!photoUrl) {
+          continue;
+        }
+
+        const metadata =
+          imageInfo.extmetadata ||
+          {};
+
+        const artist =
+          metadata.Artist?.value ||
+          "";
+
+        const license =
+          metadata.LicenseShortName
+            ?.value ||
+          "";
+
+        const licenseUrl =
+          metadata.LicenseUrl
+            ?.value ||
+          "";
+
+        const descriptionUrl =
+          imageInfo.descriptionurl ||
+          "";
+
+        const result = {
+          photoUrl,
+
+          photoAttributions: [
+            {
+              provider:
+                "Wikimedia Commons",
+
+              artist,
+
+              license,
+
+              licenseUrl,
+
+              sourceUrl:
+                descriptionUrl,
+            },
+          ],
+        };
+
+        setCached(
+          photoCache,
+          cacheKey,
+          result
+        );
+
+        return result;
+      }
+    } catch (error) {
+      console.warn(
+        "WIKIMEDIA SEARCH ATTEMPT FAILED:",
+        error.message
+      );
     }
+  }
 
-    const selectedMode =
-      String(mode || "driving")
-        .trim()
-        .toLowerCase();
+  setCached(
+    photoCache,
+    cacheKey,
+    null
+  );
 
-    if (selectedMode !== "driving") {
-      return res.status(400).json({
-        success: false,
-        error:
-          "Live in-app road routing currently supports driving. Use Google Maps for walking or transit navigation.",
-      });
-    }
+  return null;
+}
 
-    const coordinates =
-      `${originLng},${originLat};${destinationLng},${destinationLat}`;
+// -----------------------------------------------------------------------------
+// PLACE PHOTO PROXY
+// -----------------------------------------------------------------------------
 
-    const url =
-      `${OSRM_BASE_URL}/route/v1/driving/${coordinates}` +
-      "?overview=full" +
-      "&geometries=polyline" +
-      "&steps=false" +
-      "&alternatives=false";
+app.get(
+  "/api/place-photo",
+  async (req, res) => {
+    try {
+      const query = String(
+        req.query.query || ""
+      ).trim();
 
-    console.log(
-      "OSRM ROUTE REQUEST:",
-      url
-    );
+      if (!query) {
+        return res
+          .status(400)
+          .send(
+            "Place query is required."
+          );
+      }
 
-    const routeResponse =
-      await fetch(url);
-
-    const routeData =
-      await routeResponse.json();
-
-    if (
-      !routeResponse.ok ||
-      routeData.code !== "Ok"
-    ) {
-      console.error(
-        "OSRM ROUTE ERROR:",
-        routeData
+      console.log(
+        "PLACE PHOTO REQUEST:",
+        query
       );
 
-      return res.status(502).json({
-        success: false,
-        error:
-          routeData?.message ||
-          "Unable to calculate the road route.",
-      });
-    }
+      // -----------------------------------------------------------------------
+      // SEARCH WIKIMEDIA
+      // -----------------------------------------------------------------------
 
-    const route =
-      routeData.routes?.[0];
+      const params =
+        new URLSearchParams({
+          action: "query",
 
-    if (!route) {
-      return res.status(404).json({
-        success: false,
-        error:
-          "No road route was returned.",
-      });
-    }
+          generator: "search",
 
-    const encodedPolyline =
-      route.geometry;
+          gsrsearch: query,
 
-    if (
-      !encodedPolyline ||
-      String(encodedPolyline).trim() === ""
-    ) {
-      return res.status(404).json({
-        success: false,
-        error:
-          "The routing service returned no route geometry.",
-      });
-    }
+          gsrnamespace: "6",
 
-    const distanceMeters =
-      Number(route.distance);
+          gsrlimit: "5",
 
-    const durationSeconds =
-      Number(route.duration);
+          prop:
+            "imageinfo",
 
-    return res.status(200).json({
-      success: true,
+          iiprop:
+            "url",
 
-      distanceMeters:
-        Number.isFinite(distanceMeters)
-          ? distanceMeters
-          : null,
+          iiurlwidth:
+            "1600",
 
-      duration:
-        Number.isFinite(durationSeconds)
-          ? `${Math.round(
-              durationSeconds
-            )}s`
-          : null,
+          format:
+            "json",
 
-      polyline:
-        encodedPolyline,
+          origin:
+            "*",
+        });
 
-      mode: "driving",
+      const searchUrl =
+        `${WIKIMEDIA_API_URL}?${params.toString()}`;
 
-      provider: "OSRM",
-    });
-  } catch (error) {
-    console.error(
-      "ROUTE ERROR:",
-      error
-    );
+      const searchResponse =
+        await fetch(searchUrl, {
+          headers: {
+            "User-Agent":
+              APP_USER_AGENT,
 
-    return res.status(500).json({
-      success: false,
-      error:
-        "Unable to calculate the road route right now.",
-    });
-  }
-});
+            Accept:
+              "application/json",
+          },
+        });
 
-// -----------------------------------------------------------------------------
-// GROQ AI TRIP PLANNER
-// -----------------------------------------------------------------------------
+      if (!searchResponse.ok) {
+        return res
+          .status(
+            searchResponse.status
+          )
+          .send(
+            "Unable to find a place photo."
+          );
+      }
 
-app.post("/api/plan-trip", async (req, res) => {
-  try {
-    const {
-      from,
-      destination,
-      startDate,
-      endDate,
-      budget,
-      days,
-      interest,
-      transport,
-    } = req.body;
+      const searchData =
+        await searchResponse.json();
 
-    if (
-      !destination ||
-      !String(destination).trim()
-    ) {
-      return res.status(400).json({
-        success: false,
-        error:
-          "Destination is required.",
-      });
-    }
+      const pages =
+        searchData?.query?.pages
+          ? Object.values(
+              searchData.query.pages
+            )
+          : [];
 
-    if (!startDate || !endDate) {
-      return res.status(400).json({
-        success: false,
-        error:
-          "Travel start date and end date are required.",
-      });
-    }
+      let imageUrl = null;
 
-    const origin =
-      from &&
-      String(from).trim()
-        ? String(from).trim()
-        : "Current Location";
+      for (const page of pages) {
+        const imageInfo =
+          page?.imageinfo?.[0];
 
-    // ---------------------------------------------------------------------------
-    // CALCULATE DURATION
-    // ---------------------------------------------------------------------------
+        if (
+          imageInfo?.thumburl
+        ) {
+          imageUrl =
+            imageInfo.thumburl;
 
-    let tripDuration =
-      days || "Not specified";
+          break;
+        }
 
-    try {
-      const start =
-        new Date(startDate);
+        if (
+          imageInfo?.url
+        ) {
+          imageUrl =
+            imageInfo.url;
 
-      const end =
-        new Date(endDate);
-
-      if (
-        !Number.isNaN(
-          start.getTime()
-        ) &&
-        !Number.isNaN(
-          end.getTime()
-        )
-      ) {
-        const difference =
-          Math.round(
-            (end - start) /
-              (1000 * 60 * 60 * 24)
-          ) + 1;
-
-        if (difference > 0) {
-          tripDuration =
-            `${difference} day${
-              difference === 1
-                ? ""
-                : "s"
-            }`;
+          break;
         }
       }
-    } catch (_) {
-      // Keep fallback duration.
+
+      if (!imageUrl) {
+        return res
+          .status(404)
+          .send(
+            "No place photo found."
+          );
+      }
+
+      // -----------------------------------------------------------------------
+      // FETCH IMAGE
+      // -----------------------------------------------------------------------
+
+      const imageResponse =
+        await fetch(
+          imageUrl,
+          {
+            headers: {
+              "User-Agent":
+                APP_USER_AGENT,
+            },
+          }
+        );
+
+      if (!imageResponse.ok) {
+        return res
+          .status(
+            imageResponse.status
+          )
+          .send(
+            "Unable to load the place photo."
+          );
+      }
+
+      const contentType =
+        imageResponse.headers.get(
+          "content-type"
+        ) ||
+        "image/jpeg";
+
+      const imageBuffer =
+        Buffer.from(
+          await imageResponse.arrayBuffer()
+        );
+
+      res.setHeader(
+        "Content-Type",
+        contentType
+      );
+
+      res.setHeader(
+        "Cache-Control",
+        "public, max-age=86400, s-maxage=86400"
+      );
+
+      return res
+        .status(200)
+        .send(imageBuffer);
+    } catch (error) {
+      console.error(
+        "PLACE PHOTO PROXY ERROR:",
+        error
+      );
+
+      return res
+        .status(500)
+        .send(
+          error?.message ||
+            "Unable to load the place photo."
+        );
     }
+  }
+);
 
-    // ---------------------------------------------------------------------------
-    // GROQ PROMPT
-    // ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// OSRM ROAD ROUTING
+// -----------------------------------------------------------------------------
 
-    const prompt = `
+app.post(
+  "/api/route",
+  async (req, res) => {
+    try {
+      const {
+        origin,
+        destination,
+        mode,
+      } = req.body || {};
+
+      const originLat =
+        Number(
+          origin?.latitude
+        );
+
+      const originLng =
+        Number(
+          origin?.longitude
+        );
+
+      const destinationLat =
+        Number(
+          destination?.latitude
+        );
+
+      const destinationLng =
+        Number(
+          destination?.longitude
+        );
+
+      if (
+        !Number.isFinite(
+          originLat
+        ) ||
+        !Number.isFinite(
+          originLng
+        ) ||
+        !Number.isFinite(
+          destinationLat
+        ) ||
+        !Number.isFinite(
+          destinationLng
+        )
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error:
+              "Valid origin and destination coordinates are required.",
+          });
+      }
+
+      const selectedMode =
+        String(
+          mode ||
+            "driving"
+        )
+          .trim()
+          .toLowerCase();
+
+      if (
+        selectedMode !==
+        "driving"
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error:
+              "Live in-app road routing currently supports driving. Use Google Maps for walking or transit navigation.",
+          });
+      }
+
+      const coordinates =
+        `${originLng},${originLat};${destinationLng},${destinationLat}`;
+
+      const url =
+        `${OSRM_BASE_URL}/route/v1/driving/${coordinates}` +
+        "?overview=full" +
+        "&geometries=polyline" +
+        "&steps=false" +
+        "&alternatives=false";
+
+      console.log(
+        "OSRM ROUTE REQUEST:",
+        url
+      );
+
+      const routeResponse =
+        await fetch(url);
+
+      const routeData =
+        await routeResponse.json();
+
+      if (
+        !routeResponse.ok ||
+        routeData.code !==
+          "Ok"
+      ) {
+        console.error(
+          "OSRM ROUTE ERROR:",
+          routeData
+        );
+
+        return res
+          .status(502)
+          .json({
+            success: false,
+            error:
+              routeData?.message ||
+              "Unable to calculate the road route.",
+          });
+      }
+
+      const route =
+        routeData.routes?.[0];
+
+      if (
+        !route ||
+        !route.geometry
+      ) {
+        return res
+          .status(404)
+          .json({
+            success: false,
+            error:
+              "No road route was returned.",
+          });
+      }
+
+      const distanceMeters =
+        Number(
+          route.distance
+        );
+
+      const durationSeconds =
+        Number(
+          route.duration
+        );
+
+      return res
+        .status(200)
+        .json({
+          success: true,
+
+          distanceMeters:
+            Number.isFinite(
+              distanceMeters
+            )
+              ? distanceMeters
+              : null,
+
+          duration:
+            Number.isFinite(
+              durationSeconds
+            )
+              ? `${Math.round(
+                  durationSeconds
+                )}s`
+              : null,
+
+          polyline:
+            route.geometry,
+
+          mode:
+            "driving",
+
+          provider:
+            "OSRM",
+        });
+    } catch (error) {
+      console.error(
+        "ROUTE ERROR:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          success: false,
+          error:
+            "Unable to calculate the road route right now.",
+        });
+    }
+  }
+);
+
+// -----------------------------------------------------------------------------
+// AI TRIP PLANNER - GROQ
+// -----------------------------------------------------------------------------
+
+app.post(
+  "/api/plan-trip",
+  async (req, res) => {
+    try {
+      const {
+        from,
+        destination,
+        startDate,
+        endDate,
+        budget,
+        days,
+        interest,
+        transport,
+      } = req.body;
+
+      if (
+        !destination ||
+        !String(
+          destination
+        ).trim()
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error:
+              "Destination is required.",
+          });
+      }
+
+      if (
+        !startDate ||
+        !endDate
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error:
+              "Travel start date and end date are required.",
+          });
+      }
+
+      const origin =
+        from &&
+        String(from).trim()
+          ? String(from).trim()
+          : "Current Location";
+
+      let tripDuration =
+        days ||
+        "Not specified";
+
+      try {
+        const start =
+          new Date(
+            startDate
+          );
+
+        const end =
+          new Date(
+            endDate
+          );
+
+        if (
+          !Number.isNaN(
+            start.getTime()
+          ) &&
+          !Number.isNaN(
+            end.getTime()
+          )
+        ) {
+          const difference =
+            Math.round(
+              (end - start) /
+                (1000 *
+                  60 *
+                  60 *
+                  24)
+            ) + 1;
+
+          if (
+            difference >
+            0
+          ) {
+            tripDuration =
+              `${difference} day${
+                difference ===
+                1
+                  ? ""
+                  : "s"
+              }`;
+          }
+        }
+      } catch (_) {}
+
+      const prompt = `
 You are EasyTrip, a fast premium AI travel planning assistant.
 
 Create a practical, realistic and budget-conscious travel itinerary.
@@ -511,8 +1003,9 @@ GOOD:
 BAD:
 "India Gate and Red Fort"
 
-The application uses each place name with Google Places to retrieve
-location and photo information.
+The application uses each place name with OpenStreetMap
+to retrieve location information and Wikimedia Commons
+to retrieve an available photo.
 
 IMPORTANT SPEED RULE
 --------------------
@@ -562,145 +1055,150 @@ RETURN EXACTLY THIS STRUCTURE:
 }
 `;
 
-    // ---------------------------------------------------------------------------
-    // GROQ REQUEST
-    // ---------------------------------------------------------------------------
+      const groqResponse =
+        await fetch(
+          "https://api.groq.com/openai/v1/chat/completions",
+          {
+            method:
+              "POST",
 
-    const groqResponse =
-      await fetch(
-        "https://api.groq.com/openai/v1/chat/completions",
-        {
-          method: "POST",
+            headers: {
+              "Content-Type":
+                "application/json",
 
-          headers: {
-            "Content-Type":
-              "application/json",
-
-            Authorization:
-              `Bearer ${GROQ_API_KEY}`,
-          },
-
-          body: JSON.stringify({
-            model:
-              "openai/gpt-oss-20b",
-
-            messages: [
-              {
-                role: "system",
-
-                content:
-                  "You are EasyTrip. Return only valid JSON. Keep responses concise, realistic and practical.",
-              },
-
-              {
-                role: "user",
-
-                content: prompt,
-              },
-            ],
-
-            temperature: 0.3,
-
-            reasoning_effort: "low",
-
-            max_completion_tokens: 5000,
-
-            response_format: {
-              type: "json_object",
+              Authorization:
+                `Bearer ${GROQ_API_KEY}`,
             },
-          }),
-        }
-      );
 
-    const groqData =
-      await groqResponse.json();
+            body: JSON.stringify({
+              model:
+                "openai/gpt-oss-20b",
 
-    // ---------------------------------------------------------------------------
-    // GROQ ERROR
-    // ---------------------------------------------------------------------------
+              messages: [
+                {
+                  role:
+                    "system",
 
-    if (!groqResponse.ok) {
+                  content:
+                    "You are EasyTrip. Return only valid JSON. Keep responses concise, realistic and practical.",
+                },
+
+                {
+                  role:
+                    "user",
+
+                  content:
+                    prompt,
+                },
+              ],
+
+              temperature:
+                0.3,
+
+              reasoning_effort:
+                "low",
+
+              max_completion_tokens:
+                5000,
+
+              response_format: {
+                type:
+                  "json_object",
+              },
+            }),
+          }
+        );
+
+      const groqData =
+        await groqResponse.json();
+
+      if (
+        !groqResponse.ok
+      ) {
+        console.error(
+          "GROQ API ERROR:",
+          groqData
+        );
+
+        return res
+          .status(
+            groqResponse.status
+          )
+          .json({
+            success: false,
+            error:
+              groqData?.error
+                ?.message ||
+              "Groq API request failed.",
+          });
+      }
+
+      const text =
+        groqData?.choices?.[0]
+          ?.message?.content;
+
+      if (
+        !text ||
+        !String(
+          text
+        ).trim()
+      ) {
+        throw new Error(
+          "Groq returned an empty response."
+        );
+      }
+
+      let itinerary;
+
+      try {
+        itinerary =
+          JSON.parse(
+            String(
+              text
+            ).trim()
+          );
+      } catch (parseError) {
+        console.error(
+          "GROQ RETURNED INVALID JSON:",
+          parseError
+        );
+
+        console.error(
+          text
+        );
+
+        return res
+          .status(500)
+          .json({
+            success: false,
+            error:
+              "The AI returned an invalid response format.",
+          });
+      }
+
+      return res
+        .status(200)
+        .json({
+          success: true,
+          result:
+            itinerary,
+        });
+    } catch (error) {
       console.error(
-        "GROQ API ERROR:",
-        groqData
+        "TRIP GENERATION ERROR:",
+        error
       );
 
       return res
-        .status(
-          groqResponse.status
-        )
+        .status(500)
         .json({
           success: false,
           error:
-            groqData?.error?.message ||
-            "Groq API request failed.",
+            "Unable to generate the trip right now.",
         });
     }
-
-    // ---------------------------------------------------------------------------
-    // GET MODEL TEXT
-    // ---------------------------------------------------------------------------
-
-    const text =
-      groqData?.choices?.[0]
-        ?.message?.content;
-
-    if (
-      !text ||
-      !String(text).trim()
-    ) {
-      throw new Error(
-        "Groq returned an empty response."
-      );
-    }
-
-    // ---------------------------------------------------------------------------
-    // PARSE JSON
-    // ---------------------------------------------------------------------------
-
-    let itinerary;
-
-    try {
-      itinerary =
-        JSON.parse(
-          String(text).trim()
-        );
-    } catch (parseError) {
-      console.error(
-        "GROQ RETURNED INVALID JSON:",
-        parseError
-      );
-
-      console.error(text);
-
-      return res.status(500).json({
-        success: false,
-        error:
-          "The AI returned an invalid response format.",
-      });
-    }
-
-    // ---------------------------------------------------------------------------
-    // RETURN RESULT
-    // ---------------------------------------------------------------------------
-
-    return res.status(200).json({
-      success: true,
-      result: itinerary,
-    });
-  } catch (error) {
-    console.error(
-      "TRIP GENERATION ERROR:",
-      error
-    );
-
-    return res.status(500).json({
-      success: false,
-      error:
-        "Unable to generate the trip right now.",
-    });
   }
-});
+);
 
 // -----------------------------------------------------------------------------
 // START SERVER
@@ -723,15 +1221,15 @@ app.listen(
     );
 
     console.log(
-      `Google Places integration is ${
-        GOOGLE_MAPS_API_KEY
-          ? "enabled"
-          : "disabled"
-      }.`
+      "Place provider: OpenStreetMap Nominatim"
     );
 
     console.log(
-      `Route provider: OSRM`
+      "Photo provider: Wikimedia Commons"
+    );
+
+    console.log(
+      "Route provider: OSRM"
     );
 
     console.log(
